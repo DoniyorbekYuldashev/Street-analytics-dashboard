@@ -3,7 +3,7 @@ import sqlite3
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import google.generativeai as genai
+from groq import Groq
 import json
 import re
 from pathlib import Path
@@ -19,7 +19,7 @@ st.set_page_config(
 DB_PATH = Path(__file__).parent / "cv_analytics.db"
 
 # ── API key: secrets → sidebar fallback ──────────────────────────────────────
-_secret_key = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
+_secret_key = st.secrets.get("GROQ_API_KEY", "") if hasattr(st, "secrets") else ""
 
 with st.sidebar:
     st.title("⚙️ Settings")
@@ -27,13 +27,13 @@ with st.sidebar:
         st.success("✅ API key loaded from secrets")
         api_key = _secret_key
     else:
-        api_key = st.text_input("Gemini API Key", type="password", placeholder="Paste your key here…")
+        api_key = st.text_input("Groq API Key", type="password", placeholder="Paste your key here…")
         st.markdown(
             "**Get a free key:**  \n"
-            "[Google AI Studio →](https://aistudio.google.com/app/apikey)"
+            "[console.groq.com →](https://console.groq.com)"
         )
     st.markdown("---")
-    st.caption("Data: `cv_analytics.db`  \nModel: `gemini-1.5-flash`")
+    st.caption("Data: `cv_analytics.db`  \nModel: `llama-3.3-70b-versatile`")
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 @st.cache_data
@@ -93,16 +93,19 @@ Rules:
 - For time range: WHERE strftime('%H', timestamp) BETWEEN '05' AND '06'
 """
 
-# ── Gemini call ───────────────────────────────────────────────────────────────
+# ── Groq call ────────────────────────────────────────────────────────────────
 def ask_gemini(user_question: str, api_key: str) -> dict:
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(
-        "gemini-2.0-flash",
-        system_instruction=SYSTEM_PROMPT,
+    client = Groq(api_key=api_key)
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_question},
+        ],
+        temperature=0,
+        response_format={"type": "json_object"},
     )
-    response = model.generate_content(user_question)
-    raw = response.text.strip()
-    # Strip markdown code fences if model adds them anyway
+    raw = response.choices[0].message.content.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     return json.loads(raw)
@@ -238,7 +241,7 @@ with col_chat:
 
             with st.spinner("Thinking…"):
                 try:
-                    result = ask_gemini(user_input, api_key)
+                    result = ask_gemini(user_input, api_key)  # uses Groq internally
 
                     if result["answer_type"] == "text":
                         answer = result.get("text_answer", "")
@@ -282,5 +285,7 @@ with col_chat:
                     st.session_state.messages.append(
                         {"role": "assistant", "content": f"⚠️ Error: {e}"}
                     )
+                    if not api_key:
+                        st.error("Please enter your Groq API key in the sidebar.")
 
             st.rerun()
