@@ -1,0 +1,13 @@
+# Secrets - never commit this
+.streamlit/secrets.toml
+
+# DB backups and journals
+*.db-journal
+*.db.bak
+cv_analytics_synth.db
+test.db
+
+# Python
+__pycache__/
+*.pyc
+.env
