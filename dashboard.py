@@ -2,13 +2,11 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
-from groq import Groq
 import json
 import re
 from pathlib import Path
+from groq import Groq
 
-# ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Street Analytics Dashboard",
     page_icon="🚶",
@@ -18,35 +16,35 @@ st.set_page_config(
 
 DB_PATH = Path(__file__).parent / "cv_analytics.db"
 
-# ── API key: secrets → sidebar fallback ──────────────────────────────────────
+# ── API key ───────────────────────────────────────────────────────────────────
 _secret_key = st.secrets.get("GROQ_API_KEY", "") if hasattr(st, "secrets") else ""
 
 with st.sidebar:
     st.title("⚙️ Settings")
     if _secret_key:
-        st.success("✅ API key loaded from secrets")
+        st.success("✅ API key loaded")
         api_key = _secret_key
     else:
-        api_key = st.text_input("Groq API Key", type="password", placeholder="Paste your key here…")
-        st.markdown(
-            "**Get a free key:**  \n"
-            "[console.groq.com →](https://console.groq.com)"
-        )
+        api_key = st.text_input("Groq API Key", type="password", placeholder="gsk_...")
+        st.markdown("**Get free key:** [console.groq.com](https://console.groq.com)")
     st.markdown("---")
-    st.caption("Data: `cv_analytics.db`  \nModel: `llama-3.3-70b-versatile`")
+    if st.button("🔄 Refresh Data", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+    st.caption("Model: `llama-3.3-70b-versatile`")
 
-# ── DB helpers ────────────────────────────────────────────────────────────────
-@st.cache_data
-def load_overview():
+# ── DB ────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=60)
+def load_data():
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql("SELECT * FROM people_tracks", conn)
     conn.close()
     df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df["date"] = df["timestamp"].dt.date
+    df["date"] = df["timestamp"].dt.date.astype(str)
     df["hour"] = df["timestamp"].dt.hour
     return df
 
-def run_sql(query: str) -> pd.DataFrame:
+def run_sql(query):
     conn = sqlite3.connect(DB_PATH)
     try:
         df = pd.read_sql(query, conn)
@@ -54,166 +52,148 @@ def run_sql(query: str) -> pd.DataFrame:
         conn.close()
     return df
 
-# ── Schema string for the LLM ─────────────────────────────────────────────────
+# ── LLM ──────────────────────────────────────────────────────────────────────
 SCHEMA = """
 Table: people_tracks
-Columns:
-  id         INTEGER  (primary key)
-  track_id   INTEGER  (unique person track within a session)
-  label      TEXT     (values: 'male', 'female', 'child')
-  timestamp  DATETIME (format: 'YYYY-MM-DD HH:MM:SS')
-
-Available dates in data: 2026-05-28, 2026-05-29, 2026-05-30, 2026-05-31
+Columns: id, track_id, label TEXT ('male','female','child'), timestamp DATETIME
+Dates available: 2026-05-28, 2026-05-29, 2026-05-30, 2026-05-31
 """
 
-SYSTEM_PROMPT = f"""You are a data analyst assistant for a computer-vision street analytics system.
-The SQLite database schema is:
-{SCHEMA}
+SYSTEM_PROMPT = f"""You are a data analyst for a street CV analytics system.
+Schema: {SCHEMA}
 
-Your job:
-1. Understand the user's question.
-2. Decide if a SQL query + chart is needed, or if a short direct answer suffices.
-3. Respond with ONLY valid JSON in this exact format:
-
+Respond ONLY with raw JSON (no markdown):
 {{
   "answer_type": "chart" | "text",
-  "sql": "<SQL query or empty string>",
+  "sql": "<valid SQLite query or empty>",
   "chart_type": "bar" | "pie" | "line" | "table" | "",
-  "chart_title": "<title or empty>",
-  "text_answer": "<short direct answer if answer_type=text, or empty>"
+  "chart_title": "<title>",
+  "text_answer": "<short answer under 20 words>"
 }}
 
 Rules:
-- For counting/stat questions (how many, total, percent at a time range) → answer_type="text", sql with aggregate query, put the result in text_answer.
-- For distribution/comparison questions → answer_type="chart".
-- chart_type="table" for raw data requests.
-- NEVER wrap JSON in markdown code blocks. Output raw JSON only.
-- Keep text_answer under 30 words.
-- ALWAYS use 24-hour format for time filtering. Convert AM/PM to 24h: 5pm=17, 6pm=18, 7pm=19, 8pm=20, 9am=09, etc.
-- Use strftime('%H', timestamp) for hour filtering. strftime returns zero-padded strings like '17', '18'.
-- For a single hour like "at 5pm": WHERE strftime('%H', timestamp) = '17'
-- For a range like "5pm to 7pm": WHERE strftime('%H', timestamp) BETWEEN '17' AND '19'
-- Always run the SQL and return the count in text_answer for counting questions.
+- Count/stat questions → answer_type="text", run sql, put real number in text_answer
+- Distribution/trend/comparison → answer_type="chart"
+- ALWAYS convert 12h to 24h: 5pm=17, 6pm=18, 7pm=19, 8pm=20, 9am=9, 10am=10
+- Hour filter: strftime('%H', timestamp) = '17'  (zero-padded string)
+- Range: strftime('%H', timestamp) BETWEEN '17' AND '19'
+- For "which day" questions: GROUP BY DATE(timestamp)
+- For hourly trend: GROUP BY strftime('%H', timestamp)
+- chart_type="line" for time/hour trends, "bar" for comparisons, "pie" for proportions
 """
 
-# ── Groq call ────────────────────────────────────────────────────────────────
-def ask_gemini(user_question: str, api_key: str) -> dict:
+def ask_llm(question, api_key):
     client = Groq(api_key=api_key)
-    response = client.chat.completions.create(
+    resp = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_question},
+            {"role": "user", "content": question},
         ],
         temperature=0,
         response_format={"type": "json_object"},
     )
-    raw = response.choices[0].message.content.strip()
+    raw = resp.choices[0].message.content.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     return json.loads(raw)
 
 # ── Chart renderer ────────────────────────────────────────────────────────────
-def render_chart(df: pd.DataFrame, chart_type: str, title: str):
-    if df.empty:
-        st.warning("Query returned no data.")
+COLOR_MAP = {"male": "#4C9BE8", "female": "#E87C9B", "child": "#F5C842"}
+
+def render_chart(df, chart_type, title):
+    if df is None or df.empty:
+        st.warning("No data for this query.")
         return
     cols = df.columns.tolist()
-    if chart_type == "pie" and len(cols) >= 2:
-        fig = px.pie(df, names=cols[0], values=cols[1], title=title,
-                     color_discrete_sequence=px.colors.qualitative.Set2)
+    try:
+        if chart_type == "pie" and len(cols) >= 2:
+            fig = px.pie(df, names=cols[0], values=cols[1], title=title,
+                         hole=0.35, color=cols[0], color_discrete_map=COLOR_MAP)
+            fig.update_traces(textinfo="percent+label", textposition="inside")
+        elif chart_type == "line" and len(cols) >= 2:
+            fig = px.line(df, x=cols[0], y=cols[1], title=title, markers=True,
+                          color=cols[2] if len(cols) > 2 else None,
+                          color_discrete_map=COLOR_MAP)
+            fig.update_layout(xaxis_title=cols[0], yaxis_title=cols[1])
+        elif chart_type == "table":
+            st.dataframe(df, use_container_width=True, height=400)
+            return
+        else:  # bar default
+            if len(cols) >= 3:
+                fig = px.bar(df, x=cols[0], y=cols[1], color=cols[2], title=title,
+                             barmode="group", color_discrete_map=COLOR_MAP)
+            else:
+                fig = px.bar(df, x=cols[0], y=cols[1], title=title,
+                             color=cols[0], color_discrete_map=COLOR_MAP)
+        fig.update_layout(
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            font_color="#FAFAFA",
+            legend_title_text="",
+        )
         st.plotly_chart(fig, use_container_width=True)
-    elif chart_type == "bar" and len(cols) >= 2:
-        fig = px.bar(df, x=cols[0], y=cols[1], title=title, color=cols[0],
-                     color_discrete_sequence=px.colors.qualitative.Set2)
-        st.plotly_chart(fig, use_container_width=True)
-    elif chart_type == "line" and len(cols) >= 2:
-        fig = px.line(df, x=cols[0], y=cols[1], title=title, markers=True)
-        st.plotly_chart(fig, use_container_width=True)
-    elif chart_type == "table":
+    except Exception as e:
         st.dataframe(df, use_container_width=True)
-    else:
-        # Fallback: try bar
-        if len(cols) >= 2:
-            fig = px.bar(df, x=cols[0], y=cols[1], title=title)
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.dataframe(df, use_container_width=True)
+        st.caption(f"Chart fallback: {e}")
 
-# ── Main layout ───────────────────────────────────────────────────────────────
-df_all = load_overview()
+# ── Load data ─────────────────────────────────────────────────────────────────
+df_all = load_data()
 
-# Title
 st.markdown("## 🚶 Street People Analytics")
 st.markdown("---")
 
-# ── Session state for chat ────────────────────────────────────────────────────
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "last_result" not in st.session_state:
-    st.session_state.last_result = None  # {"type": "chart"|"text", "df": df, ...}
+    st.session_state.last_result = None
 
-# ── Two-column layout: left=viz, right=chat ───────────────────────────────────
 col_viz, col_chat = st.columns([1.6, 1], gap="large")
 
-# ── LEFT: Visualization panel ─────────────────────────────────────────────────
+# ── LEFT: Charts ──────────────────────────────────────────────────────────────
 with col_viz:
     if st.session_state.last_result is None:
-        # Default view: overview pie + daily bar
         st.subheader("📊 Overview")
 
-        sub1, sub2 = st.columns(2)
+        c1, c2 = st.columns(2)
 
-        # Pie: gender distribution (all days)
-        with sub1:
-            gender_counts = df_all.groupby("label").size().reset_index(name="count")
-            color_map = {"male": "#4C9BE8", "female": "#E87C9B", "child": "#F5C842"}
-            fig_pie = px.pie(
-                gender_counts,
-                names="label",
-                values="count",
-                title="Gender Distribution (All Days)",
-                color="label",
-                color_discrete_map=color_map,
-                hole=0.35,
-            )
-            fig_pie.update_traces(textposition="inside", textinfo="percent+label")
-            st.plotly_chart(fig_pie, use_container_width=True)
+        with c1:
+            # Pie: overall gender split (exclude may28 raw day)
+            df_synth = df_all[df_all["date"] != "2026-05-28"]
+            counts = df_synth.groupby("label").size().reset_index(name="count")
+            fig = px.pie(counts, names="label", values="count",
+                         title="Gender Distribution", hole=0.35,
+                         color="label", color_discrete_map=COLOR_MAP)
+            fig.update_traces(textinfo="percent+label", textposition="inside")
+            fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", font_color="#FAFAFA")
+            st.plotly_chart(fig, use_container_width=True)
 
-        # Bar: people per day per gender
-        with sub2:
-            daily = df_all.groupby(["date", "label"]).size().reset_index(name="count")
-            daily["date"] = daily["date"].astype(str)
-            fig_bar = px.bar(
-                daily,
-                x="date",
-                y="count",
-                color="label",
-                barmode="group",
-                title="Daily Count by Gender",
-                color_discrete_map=color_map,
-            )
-            st.plotly_chart(fig_bar, use_container_width=True)
+        with c2:
+            # Bar: daily totals by gender
+            daily = df_synth.groupby(["date","label"]).size().reset_index(name="count")
+            fig = px.bar(daily, x="date", y="count", color="label",
+                         barmode="group", title="Daily Count by Gender",
+                         color_discrete_map=COLOR_MAP)
+            fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", font_color="#FAFAFA",
+                              xaxis_title="Date", yaxis_title="People")
+            st.plotly_chart(fig, use_container_width=True)
 
-        # Line: hourly traffic (all days combined)
-        hourly = df_all.groupby("hour").size().reset_index(name="count")
-        fig_line = px.line(
-            hourly,
-            x="hour",
-            y="count",
-            title="Hourly Traffic Pattern (All Days)",
-            markers=True,
-            labels={"hour": "Hour of Day", "count": "People Count"},
-        )
-        fig_line.update_xaxes(tickmode="linear", dtick=1)
-        st.plotly_chart(fig_line, use_container_width=True)
+        # Line: hourly traffic all days
+        hourly = df_synth.groupby(["hour","label"]).size().reset_index(name="count")
+        fig = px.line(hourly, x="hour", y="count", color="label",
+                      title="Hourly Traffic by Gender (All Days Combined)",
+                      markers=True, color_discrete_map=COLOR_MAP)
+        fig.update_layout(xaxis=dict(tickmode="linear", dtick=1, title="Hour of Day"),
+                          yaxis_title="People Count",
+                          paper_bgcolor="rgba(0,0,0,0)", font_color="#FAFAFA")
+        st.plotly_chart(fig, use_container_width=True)
 
     else:
-        # Show result from last query
         res = st.session_state.last_result
         st.subheader("📈 Query Result")
         if res["type"] == "text":
-            st.markdown(f"### {res['answer']}")
+            st.markdown(f"<div style='font-size:2rem;font-weight:700;padding:2rem 0'>{res['answer']}</div>",
+                        unsafe_allow_html=True)
         elif res["type"] == "chart":
             render_chart(res["df"], res["chart_type"], res["chart_title"])
 
@@ -221,80 +201,64 @@ with col_viz:
             st.session_state.last_result = None
             st.rerun()
 
-# ── RIGHT: Chat panel ─────────────────────────────────────────────────────────
+# ── RIGHT: Chat ───────────────────────────────────────────────────────────────
 with col_chat:
     st.subheader("💬 Ask the Data")
 
-    # Chat history display
-    chat_container = st.container(height=460)
-    with chat_container:
+    chat_box = st.container(height=480)
+    with chat_box:
+        if not st.session_state.messages:
+            st.caption("Ask anything about the street data…")
         for msg in st.session_state.messages:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
 
-    # Input
-    user_input = st.chat_input("e.g. How many people were at 5pm–6pm?")
+    user_input = st.chat_input("e.g. How many people at 5pm? Which day was busiest?")
 
     if user_input:
         if not api_key:
-            st.error("Please enter your Gemini API key in the sidebar.")
+            st.error("Enter your Groq API key in the sidebar.")
         else:
-            # Add user message
             st.session_state.messages.append({"role": "user", "content": user_input})
-
             with st.spinner("Thinking…"):
                 try:
-                    result = ask_gemini(user_input, api_key)  # uses Groq internally
+                    result = ask_llm(user_input, api_key)
 
                     if result["answer_type"] == "text":
                         answer = result.get("text_answer", "")
-                        # Always run SQL if present and inject the real number
                         if result.get("sql"):
                             try:
                                 df_res = run_sql(result["sql"])
                                 if not df_res.empty:
                                     val = df_res.iloc[0, 0]
-                                    # Replace placeholder numbers in answer with real value
-                                    if answer:
-                                        import re as _re
-                                        answer = _re.sub(r'\b\d+\b', str(val), answer, count=1)
-                                    else:
-                                        answer = str(val)
-                            except Exception as ex:
-                                answer = answer or f"SQL error: {ex}"
-                        answer_str = str(answer) if answer else "No data found."
-                        st.session_state.messages.append(
-                            {"role": "assistant", "content": answer_str}
-                        )
-                        st.session_state.last_result = {"type": "text", "answer": answer_str}
+                                    answer = re.sub(r'\b\d+\b', str(val), answer, count=1) if answer else str(val)
+                            except Exception:
+                                pass
+                        answer = str(answer) if answer else "No data found."
+                        st.session_state.messages.append({"role": "assistant", "content": answer})
+                        st.session_state.last_result = {"type": "text", "answer": answer}
 
-                    elif result["answer_type"] == "chart":
+                    else:
                         sql = result.get("sql", "")
                         if sql:
                             df_res = run_sql(sql)
+                            title = result.get("chart_title", user_input)
                             st.session_state.last_result = {
-                                "type": "chart",
-                                "df": df_res,
+                                "type": "chart", "df": df_res,
                                 "chart_type": result.get("chart_type", "bar"),
-                                "chart_title": result.get("chart_title", user_input),
+                                "chart_title": title,
                             }
                             st.session_state.messages.append(
-                                {"role": "assistant", "content": f"📊 Chart ready: **{result.get('chart_title', user_input)}**"}
-                            )
+                                {"role": "assistant", "content": f"📊 **{title}**"})
                         else:
                             st.session_state.messages.append(
-                                {"role": "assistant", "content": "Couldn't generate a chart for that."}
-                            )
+                                {"role": "assistant", "content": "Couldn't generate a chart for that."})
 
-                except json.JSONDecodeError as e:
+                except json.JSONDecodeError:
                     st.session_state.messages.append(
-                        {"role": "assistant", "content": f"⚠️ Couldn't parse response. Try rephrasing."}
-                    )
+                        {"role": "assistant", "content": "⚠️ Couldn't parse response. Try rephrasing."})
                 except Exception as e:
                     st.session_state.messages.append(
-                        {"role": "assistant", "content": f"⚠️ Error: {e}"}
-                    )
-                    if not api_key:
-                        st.error("Please enter your Groq API key in the sidebar.")
+                        {"role": "assistant", "content": f"⚠️ {e}"})
 
             st.rerun()
