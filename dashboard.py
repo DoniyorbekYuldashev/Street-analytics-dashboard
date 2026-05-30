@@ -84,13 +84,16 @@ Your job:
 }}
 
 Rules:
-- For counting/stat questions (how many, total, percent at a time range) → answer_type="text", sql="" or a simple aggregate sql, give the number directly in text_answer.
+- For counting/stat questions (how many, total, percent at a time range) → answer_type="text", sql with aggregate query, put the result in text_answer.
 - For distribution/comparison questions → answer_type="chart".
 - chart_type="table" for raw data requests.
 - NEVER wrap JSON in markdown code blocks. Output raw JSON only.
 - Keep text_answer under 30 words.
-- Use strftime('%H', timestamp) for hour filtering.
-- For time range: WHERE strftime('%H', timestamp) BETWEEN '05' AND '06'
+- ALWAYS use 24-hour format for time filtering. Convert AM/PM to 24h: 5pm=17, 6pm=18, 7pm=19, 8pm=20, 9am=09, etc.
+- Use strftime('%H', timestamp) for hour filtering. strftime returns zero-padded strings like '17', '18'.
+- For a single hour like "at 5pm": WHERE strftime('%H', timestamp) = '17'
+- For a range like "5pm to 7pm": WHERE strftime('%H', timestamp) BETWEEN '17' AND '19'
+- Always run the SQL and return the count in text_answer for counting questions.
 """
 
 # ── Groq call ────────────────────────────────────────────────────────────────
@@ -245,14 +248,20 @@ with col_chat:
 
                     if result["answer_type"] == "text":
                         answer = result.get("text_answer", "")
-                        # If there's a sql, run it and append numbers
+                        # Always run SQL if present and inject the real number
                         if result.get("sql"):
                             try:
                                 df_res = run_sql(result["sql"])
-                                if not df_res.empty and not answer:
-                                    answer = df_res.iloc[0, 0]
-                            except Exception:
-                                pass
+                                if not df_res.empty:
+                                    val = df_res.iloc[0, 0]
+                                    # Replace placeholder numbers in answer with real value
+                                    if answer:
+                                        import re as _re
+                                        answer = _re.sub(r'\b\d+\b', str(val), answer, count=1)
+                                    else:
+                                        answer = str(val)
+                            except Exception as ex:
+                                answer = answer or f"SQL error: {ex}"
                         answer_str = str(answer) if answer else "No data found."
                         st.session_state.messages.append(
                             {"role": "assistant", "content": answer_str}
