@@ -158,8 +158,8 @@ with col_viz:
         c1, c2 = st.columns(2)
 
         with c1:
-            # Pie: overall gender split (exclude may28 raw day)
-            df_synth = df_all[df_all["date"] != "2026-05-28"]
+            # Pie: overall gender split (all days)
+            df_synth = df_all
             counts = df_synth.groupby("label").size().reset_index(name="count")
             fig = px.pie(counts, names="label", values="count",
                          title="Gender Distribution", hole=0.35,
