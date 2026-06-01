@@ -82,14 +82,14 @@ Rules:
 - chart_type="line" for time/hour trends, "bar" for comparisons, "pie" for proportions
 """
 
-def ask_llm(question, api_key):
+def ask_llm(question, api_key, history):
     client = Groq(api_key=api_key)
+    # Keep last 8 messages for context (4 turns)
+    recent = history[-8:] if len(history) > 8 else history
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + recent + [{"role": "user", "content": question}]
     resp = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": question},
-        ],
+        messages=messages,
         temperature=0,
         response_format={"type": "json_object"},
     )
@@ -222,7 +222,9 @@ with col_chat:
             st.session_state.messages.append({"role": "user", "content": user_input})
             with st.spinner("Thinking…"):
                 try:
-                    result = ask_llm(user_input, api_key)
+                    # Build history for LLM (only role+content, not our extra keys)
+                    llm_history = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages]
+                    result = ask_llm(user_input, api_key, llm_history)
 
                     if result["answer_type"] == "text":
                         answer = result.get("text_answer", "")
@@ -248,6 +250,7 @@ with col_chat:
                                 "chart_type": result.get("chart_type", "bar"),
                                 "chart_title": title,
                             }
+                            reply = f"📊 **{title}**\n```sql\n{sql}\n```"
                             st.session_state.messages.append(
                                 {"role": "assistant", "content": f"📊 **{title}**"})
                         else:
